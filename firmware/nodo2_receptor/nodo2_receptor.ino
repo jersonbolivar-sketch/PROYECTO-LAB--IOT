@@ -21,10 +21,17 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
+// Si existe secrets.h en la carpeta del sketch se usa; si no, estos marcadores.
+// (Así el sketch compila aunque solo pegues este archivo.)
 #if __has_include("secrets.h")
   #include "secrets.h"
 #else
-  #include "secrets.example.h"
+  #define WIFI_SSID      "NOMBRE_RED_WIFI"
+  #define WIFI_PASSWORD  "CLAVE_WIFI"
+  #define INFLUX_URL     "https://REGION.cloud2.influxdata.com"
+  #define INFLUX_ORG     "NOMBRE_ORGANIZACION"
+  #define INFLUX_BUCKET  "iot_ganado"
+  #define INFLUX_TOKEN   "TOKEN_PRIVADO"
 #endif
 
 // 0 = solo LoRa + Monitor serie;  1 = además enviar a InfluxDB Cloud
