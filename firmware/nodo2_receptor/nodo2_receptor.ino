@@ -59,13 +59,16 @@ struct Datos {
   int   id = -1;
   long  seq = -1;
   float t1 = NAN, t2 = NAN, ta = NAN, h = NAN, p = NAN, tb = NAN, pb = NAN;
-  int   calefaccion = -1, cortina = -1, err = -1;
+  int   calefaccion = -1, cortina = -1, cest = -1, err = -1;
 };
 
 long ultimaSeq = -1;
 unsigned long ultimaRecepcion = 0;
 bool avisoSinSenal = false;
 unsigned long perdidos = 0;
+unsigned long paquetesOk = 0;
+unsigned long ultimoEstado = 0;
+#define INTERVALO_ESTADO_MS 60000UL   // cada cuánto se envía el estado del gateway
 
 // ---------------------------------------------------------------
 float aFloat(const String &v) {
@@ -95,6 +98,7 @@ bool parsear(const String &pkt, Datos &d) {
       else if (k == "PB")          d.pb = aFloat(v);
       else if (k == "CALEFACCION") d.calefaccion = v.toInt();
       else if (k == "CORTINA")     d.cortina = v.toInt();
+      else if (k == "CEST")        d.cest = v.toInt();
       else if (k == "ERR")         d.err = v.toInt();
     }
     inicio = coma + 1;
@@ -116,9 +120,11 @@ void campoInt(String &s, bool &primero, const char *k, long v) {
   s += k; s += '='; s += String(v); s += 'i';
 }
 
-// Formato: ganado,nodo=1 temp_amb=2.8,hum=78.5,...,seq=125i
+// Formato: ganado,nodo=1 temp_amb=2.8,humedad=78.5,...,seq=125i
 // Sin marca de tiempo: InfluxDB asigna la hora de llegada.
-String lineaInflux(const Datos &d, int rssi, float snr) {
+// cortina = orden (1 desplegar), cortina_estado = posición física
+//   0 recogida, 1 desplegada, 2 desplegando, 3 recogiendo, 4 desconocida, 5 falla
+String lineaInflux(const Datos &d, int rssi, float snr, long perdidosAhora) {
   String s = "ganado,nodo=" + String(d.id);
   bool primero = true;
   campo(s, primero, "temp_suelo1", d.t1);
@@ -130,8 +136,10 @@ String lineaInflux(const Datos &d, int rssi, float snr) {
   campo(s, primero, "presion_bmp", d.pb);
   campoInt(s, primero, "calefaccion", d.calefaccion);
   campoInt(s, primero, "cortina",     d.cortina);
+  campoInt(s, primero, "cortina_estado", d.cest);
   campoInt(s, primero, "err",         d.err);
   campoInt(s, primero, "seq",         d.seq);
+  campoInt(s, primero, "perdidos",    perdidosAhora);
   campo(s, primero, "rssi", (float)rssi);
   campo(s, primero, "snr",  snr);
   return s;
@@ -216,8 +224,10 @@ void loop() {
       return;
     }
 
+    long perdidosAhora = 0;
     if (ultimaSeq >= 0 && d.seq > ultimaSeq + 1) {
-      perdidos += d.seq - ultimaSeq - 1;
+      perdidosAhora = d.seq - ultimaSeq - 1;
+      perdidos += perdidosAhora;
       Serial.printf("  Aviso: se perdieron %ld paquete(s)\n", d.seq - ultimaSeq - 1);
     } else if (ultimaSeq >= 0 && d.seq <= ultimaSeq) {
       Serial.println(F("  Aviso: SEQ reiniciada (¿se reinició el Nodo 1?)"));
@@ -225,12 +235,13 @@ void loop() {
     ultimaSeq = d.seq;
     ultimaRecepcion = millis();
     avisoSinSenal = false;
+    paquetesOk++;
 
     Serial.printf("[RX] RSSI=%d dBm SNR=%.1f dB | %s\n", rssi, snr, pkt.c_str());
-    Serial.printf("  Suelo T1=%.2f T2=%.2f | Amb %.2f °C %.1f %% %.1f hPa | Calef=%d Cortina=%d ERR=%d | perdidos=%lu\n",
-                  d.t1, d.t2, d.ta, d.h, d.p, d.calefaccion, d.cortina, d.err, perdidos);
+    Serial.printf("  Suelo T1=%.2f T2=%.2f | Amb %.2f °C %.1f %% %.1f hPa | Calef=%d Cortina=%d (estado %d) ERR=%d | perdidos=%lu\n",
+                  d.t1, d.t2, d.ta, d.h, d.p, d.calefaccion, d.cortina, d.cest, d.err, perdidos);
 
-    String linea = lineaInflux(d, rssi, snr);
+    String linea = lineaInflux(d, rssi, snr, perdidosAhora);
     Serial.printf("  Influx: %s\n", linea.c_str());
 #if ENVIAR_A_INFLUX
     Serial.println(enviarInflux(linea) ? F("  -> InfluxDB OK") : F("  -> InfluxDB FALLO"));
@@ -240,5 +251,20 @@ void loop() {
   if (!avisoSinSenal && millis() - ultimaRecepcion > TIMEOUT_LORA_MS) {
     Serial.println(F("ALERTA: no llegan paquetes LoRa del Nodo 1"));
     avisoSinSenal = true;
+    ultimoEstado = 0;   // avisar ya a InfluxDB
+  }
+
+  // Estado del gateway (sirve para ver en Grafana si el Nodo 1 dejó de llegar)
+  if (ultimoEstado == 0 || millis() - ultimoEstado >= INTERVALO_ESTADO_MS) {
+    ultimoEstado = millis();
+    String e = "gateway,nodo=2 sin_senal=" + String(avisoSinSenal ? 1 : 0) + "i" +
+               ",paquetes_ok=" + String(paquetesOk) + "i" +
+               ",perdidos_total=" + String(perdidos) + "i" +
+               ",uptime_s=" + String(millis() / 1000) + "i";
+#if ENVIAR_A_INFLUX
+    if (WiFi.status() == WL_CONNECTED) e += ",wifi_rssi=" + String(WiFi.RSSI()) + "i";
+    enviarInflux(e);
+#endif
+    Serial.printf("  Estado gateway: %s\n", e.c_str());
   }
 }
